@@ -1,11 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""
-ЛР11 - Имитация Prometheus + Grafana + Alertmanager
-Собирает метрики с контейнера безопасности, показывает дашборд и алёрты
-"""
-
 import urllib.request
 import urllib.error
 import ssl
