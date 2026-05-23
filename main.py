@@ -2,8 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-ЛР11 - Мониторинг качества ПО
-Контейнер безопасности с метриками Prometheus
+ЛР11 - Контейнер безопасности с экспортом метрик в формате Prometheus
 """
 
 import http.server
@@ -13,15 +12,23 @@ import json
 from datetime import datetime
 from socketserver import ThreadingMixIn
 
-# ========== ПРОСТАЯ РЕАЛИЗАЦИЯ МЕТРИК (без prometheus_client) ==========
+# ========== МЕТРИКИ (хранятся в памяти) ==========
 class Metrics:
     def __init__(self):
         self.blocked_count = 0
         self.icmp_flood_count = 0
+        self.arp_count = 0
+        self.tcp_syn_count = 0
         self.request_times = []
 
-    def inc_blocked(self):
+    def inc_blocked(self, attack_type="generic"):
         self.blocked_count += 1
+        if attack_type == "icmp":
+            pass  # отдельный счётчик не нужен, используем метку
+        elif attack_type == "arp":
+            self.arp_count += 1
+        elif attack_type == "tcp_syn":
+            self.tcp_syn_count += 1
 
     def inc_icmp_flood(self):
         self.icmp_flood_count += 1
@@ -33,9 +40,13 @@ class Metrics:
 
     def get_metrics_text(self):
         avg_time = sum(self.request_times) / len(self.request_times) if self.request_times else 0
+
+        # Формат Prometheus
         return f"""# HELP security_blocks_total Всего заблокированных запросов
 # TYPE security_blocks_total counter
-security_blocks_total {self.blocked_count}
+security_blocks_total{{attack_type="generic"}} {self.blocked_count}
+security_blocks_total{{attack_type="arp"}} {self.arp_count}
+security_blocks_total{{attack_type="tcp_syn"}} {self.tcp_syn_count}
 # HELP security_icmp_flood_total ICMP-flood аномалии
 # TYPE security_icmp_flood_total counter
 security_icmp_flood_total {self.icmp_flood_count}
@@ -70,7 +81,7 @@ class SecurityHandler(http.server.SimpleHTTPRequestHandler):
         # Эндпоинт /block - блокировка
         if self.path == '/block':
             metrics.inc_blocked()
-            log_event("BLOCK", client_ip, "ACCESS_DENIED", "ICMP/ARP/TCP")
+            log_event("BLOCK", client_ip, "ACCESS_DENIED", "generic")
 
             self.send_response(403)
             self.send_header('Content-type', 'text/plain')
@@ -78,6 +89,36 @@ class SecurityHandler(http.server.SimpleHTTPRequestHandler):
             self.wfile.write(b"=== SECURITY CONTAINER ===\n")
             self.wfile.write(b"Access to equipment DENIED\n")
             self.wfile.write(b"HTTP 403 Forbidden\n")
+
+        # Эндпоинт /block/icmp - имитация ICMP-атаки
+        elif self.path == '/block/icmp':
+            metrics.inc_blocked("icmp")
+            log_event("BLOCK", client_ip, "ICMP_BLOCKED", "ICMP Echo Request")
+
+            self.send_response(403)
+            self.send_header('Content-type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(b"ICMP packet blocked\n")
+
+        # Эндпоинт /block/arp - имитация ARP-атаки
+        elif self.path == '/block/arp':
+            metrics.inc_blocked("arp")
+            log_event("BLOCK", client_ip, "ARP_BLOCKED", "ARP request")
+
+            self.send_response(403)
+            self.send_header('Content-type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(b"ARP request blocked\n")
+
+        # Эндпоинт /block/tcp - имитация TCP SYN-сканирования
+        elif self.path == '/block/tcp':
+            metrics.inc_blocked("tcp_syn")
+            log_event("BLOCK", client_ip, "TCP_SYN_BLOCKED", "port scan")
+
+            self.send_response(403)
+            self.send_header('Content-type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(b"TCP SYN packet blocked\n")
 
         # Эндпоинт /metrics - метрики Prometheus
         elif self.path == '/metrics':
@@ -93,7 +134,7 @@ class SecurityHandler(http.server.SimpleHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(json.dumps(ACCESS_LOG[-20:], indent=2, ensure_ascii=False).encode('utf-8'))
 
-        # Эндпоинт /flood - имитация ICMP-flood (увеличивает счётчик аномалий)
+        # Эндпоинт /flood - имитация ICMP-flood (аномалия)
         elif self.path == '/flood':
             metrics.inc_icmp_flood()
             log_event("ANOMALY", client_ip, "ICMP_FLOOD_DETECTED", "10+ packets/sec")
@@ -109,7 +150,7 @@ class SecurityHandler(http.server.SimpleHTTPRequestHandler):
             self.send_header('Content-type', 'text/plain')
             self.end_headers()
             self.wfile.write(b"Security Container is running\n")
-            self.wfile.write(b"Endpoints: /block, /metrics, /logs, /flood\n")
+            self.wfile.write(b"Endpoints: /block, /block/icmp, /block/arp, /block/tcp, /metrics, /logs, /flood\n")
 
         else:
             self.send_response(404)
@@ -121,15 +162,14 @@ class SecurityHandler(http.server.SimpleHTTPRequestHandler):
         metrics.add_request_time(duration_ms)
 
     def log_message(self, format, *args):
-        # Отключаем стандартное логирование, чтобы не дублировать
-        pass
+        pass  # отключаем стандартное логирование
 
 class ThreadedHTTPServer(ThreadingMixIn, http.server.HTTPServer):
     pass
 
 # ========== ЗАПУСК ==========
 def main():
-    PORT = 8443
+    PORT = 8444
     CERT_FILE = "server.crt"
     KEY_FILE = "server.key"
 
@@ -137,7 +177,7 @@ def main():
     print("SECURITY CONTAINER with Prometheus Metrics (LR11)")
     print("="*60)
 
-    # Генерация самоподписанного сертификата (если нет)
+    # Генерация самоподписанного сертификата
     import subprocess
     import os
     if not os.path.exists(CERT_FILE) or not os.path.exists(KEY_FILE):
@@ -158,14 +198,17 @@ def main():
     server.socket = context.wrap_socket(server.socket, server_side=True)
 
     print(f"[OK] HTTPS server started on port {PORT} (TLS 1.3)")
-    print(f"[OK] Prometheus metrics available at http://localhost:9091/metrics (same port 8443)")
+    print(f"[OK] Prometheus metrics available at https://localhost:{PORT}/metrics")
     print()
     print("ENDPOINTS:")
-    print("  GET /block   - returns 403 Forbidden (block simulation)")
-    print("  GET /metrics - returns Prometheus metrics")
-    print("  GET /logs    - returns JSON log")
-    print("  GET /flood   - simulates ICMP-flood anomaly")
-    print("  GET /        - health check")
+    print("  GET /block       - generic block (403)")
+    print("  GET /block/icmp  - ICMP attack simulation")
+    print("  GET /block/arp   - ARP attack simulation")
+    print("  GET /block/tcp   - TCP SYN scan simulation")
+    print("  GET /metrics     - Prometheus metrics")
+    print("  GET /logs        - JSON log")
+    print("  GET /flood       - ICMP-flood anomaly simulation")
+    print("  GET /            - health check")
     print()
     print("Press Ctrl+C to stop")
 
