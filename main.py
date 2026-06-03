@@ -1,222 +1,93 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+import matplotlib
+matplotlib.use('Agg')
+import warnings
+warnings.filterwarnings('ignore')
+import matplotlib.pyplot as plt
+plt.rcParams['font.family'] = 'DejaVu Sans'
 
-"""
-ЛР11 - Контейнер безопасности с экспортом метрик в формате Prometheus
-"""
+import numpy as np
+from sklearn.datasets import make_blobs
+import pandas as pd
+from sklearn.cluster import KMeans
+from yellowbrick.cluster import KElbowVisualizer
+from collections import Counter
+import seaborn as sns
 
-import http.server
-import ssl
-import time
-import json
-from datetime import datetime
-from socketserver import ThreadingMixIn
+print("=" * 60)
+print("ИНДИВИДУАЛЬНОЕ ЗАДАНИЕ (ВАРИАНТ 31)")
+print("3 параметра: [0.1-5], [0.1-3], [10%,20%,80%,90%]")
+print("=" * 60)
 
-# ========== МЕТРИКИ (хранятся в памяти) ==========
-class Metrics:
-    def __init__(self):
-        self.blocked_count = 0
-        self.icmp_flood_count = 0
-        self.arp_count = 0
-        self.tcp_syn_count = 0
-        self.request_times = []
+# Генерация базовых данных (3 признака)
+dataset, _ = make_blobs(
+    n_samples=200,
+    centers=4,
+    n_features=3,
+    cluster_std=0.5,
+    random_state=31
+)
 
-    def inc_blocked(self, attack_type="generic"):
-        self.blocked_count += 1
-        if attack_type == "icmp":
-            pass  # отдельный счётчик не нужен, используем метку
-        elif attack_type == "arp":
-            self.arp_count += 1
-        elif attack_type == "tcp_syn":
-            self.tcp_syn_count += 1
+# Приводим param1 к диапазону [0.1, 5]
+dataset[:, 0] = np.interp(dataset[:, 0],
+                          (dataset[:, 0].min(), dataset[:, 0].max()),
+                          (0.1, 5))
 
-    def inc_icmp_flood(self):
-        self.icmp_flood_count += 1
+# Приводим param2 к диапазону [0.1, 3]
+dataset[:, 1] = np.interp(dataset[:, 1],
+                          (dataset[:, 1].min(), dataset[:, 1].max()),
+                          (0.1, 3))
 
-    def add_request_time(self, duration_ms):
-        self.request_times.append(duration_ms)
-        if len(self.request_times) > 100:
-            self.request_times.pop(0)
+# Параметр 3: категории 10%, 20%, 80%, 90%
+categories = [0.1, 0.2, 0.8, 0.9]
+dataset[:, 2] = np.random.choice(categories, 200)
 
-    def get_metrics_text(self):
-        avg_time = sum(self.request_times) / len(self.request_times) if self.request_times else 0
+# Создаём DataFrame
+df = pd.DataFrame(dataset, columns=['param1', 'param2', 'param3'])
+print("\nНабор данных (первые 10 строк):")
+print(df.head(10))
 
-        # Формат Prometheus
-        return f"""# HELP security_blocks_total Всего заблокированных запросов
-# TYPE security_blocks_total counter
-security_blocks_total{{attack_type="generic"}} {self.blocked_count}
-security_blocks_total{{attack_type="arp"}} {self.arp_count}
-security_blocks_total{{attack_type="tcp_syn"}} {self.tcp_syn_count}
-# HELP security_icmp_flood_total ICMP-flood аномалии
-# TYPE security_icmp_flood_total counter
-security_icmp_flood_total {self.icmp_flood_count}
-# HELP security_request_duration_seconds Среднее время обработки
-# TYPE security_request_duration_seconds gauge
-security_request_duration_seconds {avg_time:.3f}
-"""
+# ============================================================
+# ГРАФИК 1: МЕТОД ЛОКТЯ (Elbow)
+# ============================================================
+model = KMeans()
+visualizer = KElbowVisualizer(model, k=(1, 12))
+visualizer.fit(df[['param1', 'param2']])
+visualizer.show(outpath="individual_elbow.png")
+print("\nГрафик 1 сохранён: individual_elbow.png")
 
-metrics = Metrics()
+# Определяем оптимальное k
+optimal_k = visualizer.elbow_value_
+print(f"Оптимальное количество кластеров: {optimal_k}")
 
-# ========== ЖУРНАЛИРОВАНИЕ ==========
-ACCESS_LOG = []
+# ============================================================
+# КЛАСТЕРИЗАЦИЯ С ОПТИМАЛЬНЫМ k
+# ============================================================
+kmeans = KMeans(n_clusters=optimal_k, init='k-means++', random_state=31).fit(df[['param1', 'param2']])
 
-def log_event(event_type, source, action, details=""):
-    entry = {
-        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "type": event_type,
-        "source": source,
-        "action": action,
-        "details": details
-    }
-    ACCESS_LOG.append(entry)
-    print(f"[LOG] {event_type} | {source} | {action} | {details}")
+print("\nПрогнозируемые кластеры (первые 20):")
+print(kmeans.labels_[:20])
 
-# ========== HTTPS-СЕРВЕР ==========
-class SecurityHandler(http.server.SimpleHTTPRequestHandler):
+print("\nКоординаты центроидов:")
+print(kmeans.cluster_centers_)
 
-    def do_GET(self):
-        start_time = time.time()
-        client_ip = self.client_address[0]
+print(f"\nВнутрикластерная сумма квадратов: {kmeans.inertia_}")
+print(f"Количество итераций: {kmeans.n_iter_}")
 
-        # Эндпоинт /block - блокировка
-        if self.path == '/block':
-            metrics.inc_blocked()
-            log_event("BLOCK", client_ip, "ACCESS_DENIED", "generic")
+print("\nРазмер каждого кластера:")
+print(Counter(kmeans.labels_))
 
-            self.send_response(403)
-            self.send_header('Content-type', 'text/plain')
-            self.end_headers()
-            self.wfile.write(b"=== SECURITY CONTAINER ===\n")
-            self.wfile.write(b"Access to equipment DENIED\n")
-            self.wfile.write(b"HTTP 403 Forbidden\n")
+# ============================================================
+# ГРАФИК 2: ДИАГРАММА РАССЕЯНИЯ С КЛАСТЕРАМИ И ЦЕНТРОИДАМИ
+# ============================================================
+plt.figure(figsize=(10, 6))
+sns.scatterplot(data=df, x='param1', y='param2', hue=kmeans.labels_, palette='viridis')
+plt.scatter(kmeans.cluster_centers_[:, 0], kmeans.cluster_centers_[:, 1],
+            marker='X', c='red', s=200, label='centroids')
+plt.title('Кластеризация данных (вариант 31)')
+plt.xlabel('Параметр 1 [0.1; 5]')
+plt.ylabel('Параметр 2 [0.1; 3]')
+plt.legend()
+plt.savefig("individual_clusters.png")
 
-        # Эндпоинт /block/icmp - имитация ICMP-атаки
-        elif self.path == '/block/icmp':
-            metrics.inc_blocked("icmp")
-            log_event("BLOCK", client_ip, "ICMP_BLOCKED", "ICMP Echo Request")
 
-            self.send_response(403)
-            self.send_header('Content-type', 'text/plain')
-            self.end_headers()
-            self.wfile.write(b"ICMP packet blocked\n")
 
-        # Эндпоинт /block/arp - имитация ARP-атаки
-        elif self.path == '/block/arp':
-            metrics.inc_blocked("arp")
-            log_event("BLOCK", client_ip, "ARP_BLOCKED", "ARP request")
-
-            self.send_response(403)
-            self.send_header('Content-type', 'text/plain')
-            self.end_headers()
-            self.wfile.write(b"ARP request blocked\n")
-
-        # Эндпоинт /block/tcp - имитация TCP SYN-сканирования
-        elif self.path == '/block/tcp':
-            metrics.inc_blocked("tcp_syn")
-            log_event("BLOCK", client_ip, "TCP_SYN_BLOCKED", "port scan")
-
-            self.send_response(403)
-            self.send_header('Content-type', 'text/plain')
-            self.end_headers()
-            self.wfile.write(b"TCP SYN packet blocked\n")
-
-        # Эндпоинт /metrics - метрики Prometheus
-        elif self.path == '/metrics':
-            self.send_response(200)
-            self.send_header('Content-type', 'text/plain')
-            self.end_headers()
-            self.wfile.write(metrics.get_metrics_text().encode('utf-8'))
-
-        # Эндпоинт /logs - журнал событий
-        elif self.path == '/logs':
-            self.send_response(200)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-            self.wfile.write(json.dumps(ACCESS_LOG[-20:], indent=2, ensure_ascii=False).encode('utf-8'))
-
-        # Эндпоинт /flood - имитация ICMP-flood (аномалия)
-        elif self.path == '/flood':
-            metrics.inc_icmp_flood()
-            log_event("ANOMALY", client_ip, "ICMP_FLOOD_DETECTED", "10+ packets/sec")
-
-            self.send_response(429)
-            self.send_header('Content-type', 'text/plain')
-            self.end_headers()
-            self.wfile.write(b"ICMP-FLOOD DETECTED - temporary block for 100 sec\n")
-
-        # Эндпоинт / - проверка здоровья
-        elif self.path == '/':
-            self.send_response(200)
-            self.send_header('Content-type', 'text/plain')
-            self.end_headers()
-            self.wfile.write(b"Security Container is running\n")
-            self.wfile.write(b"Endpoints: /block, /block/icmp, /block/arp, /block/tcp, /metrics, /logs, /flood\n")
-
-        else:
-            self.send_response(404)
-            self.end_headers()
-            self.wfile.write(b"404 Not Found\n")
-
-        # Записываем время обработки запроса
-        duration_ms = (time.time() - start_time) * 1000
-        metrics.add_request_time(duration_ms)
-
-    def log_message(self, format, *args):
-        pass  # отключаем стандартное логирование
-
-class ThreadedHTTPServer(ThreadingMixIn, http.server.HTTPServer):
-    pass
-
-# ========== ЗАПУСК ==========
-def main():
-    PORT = 8444
-    CERT_FILE = "server.crt"
-    KEY_FILE = "server.key"
-
-    print("="*60)
-    print("SECURITY CONTAINER with Prometheus Metrics (LR11)")
-    print("="*60)
-
-    # Генерация самоподписанного сертификата
-    import subprocess
-    import os
-    if not os.path.exists(CERT_FILE) or not os.path.exists(KEY_FILE):
-        print("[INFO] Generating self-signed certificate...")
-        subprocess.run([
-            "openssl", "req", "-x509", "-newkey", "rsa:4096",
-            "-keyout", KEY_FILE, "-out", CERT_FILE,
-            "-days", "365", "-nodes",
-            "-subj", "/CN=localhost"
-        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        print("[OK] Certificate generated")
-
-    server = ThreadedHTTPServer(("0.0.0.0", PORT), SecurityHandler)
-
-    # Настройка TLS 1.3
-    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    context.load_cert_chain(CERT_FILE, KEY_FILE)
-    server.socket = context.wrap_socket(server.socket, server_side=True)
-
-    print(f"[OK] HTTPS server started on port {PORT} (TLS 1.3)")
-    print(f"[OK] Prometheus metrics available at https://localhost:{PORT}/metrics")
-    print()
-    print("ENDPOINTS:")
-    print("  GET /block       - generic block (403)")
-    print("  GET /block/icmp  - ICMP attack simulation")
-    print("  GET /block/arp   - ARP attack simulation")
-    print("  GET /block/tcp   - TCP SYN scan simulation")
-    print("  GET /metrics     - Prometheus metrics")
-    print("  GET /logs        - JSON log")
-    print("  GET /flood       - ICMP-flood anomaly simulation")
-    print("  GET /            - health check")
-    print()
-    print("Press Ctrl+C to stop")
-
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print("\n[STOP] Server stopped")
-        server.shutdown()
-
-if __name__ == "__main__":
-    main()
